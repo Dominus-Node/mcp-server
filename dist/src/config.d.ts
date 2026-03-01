@@ -6,6 +6,7 @@ export interface McpConfig {
     socks5ProxyPort: number;
     fetchTimeoutMs: number;
     fetchMaxResponseBytes: number;
+    mcpAgentSecret: string;
 }
 export declare class ConfigError extends Error {
     constructor(message: string);

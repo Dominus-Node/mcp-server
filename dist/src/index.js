@@ -13,8 +13,11 @@ import { registerPlansTools } from "./tools/plans.js";
 import { registerSessionsTools } from "./tools/sessions.js";
 import { registerAccountTools } from "./tools/account.js";
 import { registerCryptoTools } from "./tools/crypto.js";
+import { registerPaypalTools } from "./tools/paypal.js";
 import { registerAgentWalletTools } from "./tools/agent-wallet.js";
 import { registerWalletAuthTools } from "./tools/wallet-auth.js";
+import { registerSlotsTools } from "./tools/slots.js";
+import { registerTeamsTools } from "./tools/teams.js";
 async function main() {
     let config;
     try {
@@ -34,7 +37,14 @@ async function main() {
         throw err;
     }
     const tokenManager = new TokenManager(config.apiUrl);
-    const httpClient = new HttpClient(config.apiUrl, tokenManager);
+    const httpClient = new HttpClient(config.apiUrl, tokenManager, config.mcpAgentSecret);
+    // Clear credentials on process shutdown to minimize in-memory exposure time
+    function cleanupCredentials() {
+        tokenManager.clear();
+    }
+    process.on("SIGINT", () => { cleanupCredentials(); process.exit(0); });
+    process.on("SIGTERM", () => { cleanupCredentials(); process.exit(0); });
+    process.on("exit", cleanupCredentials);
     const server = new McpServer({
         name: "dominusnode",
         version: "1.0.0",
@@ -49,14 +59,17 @@ async function main() {
         process.stderr.write("Use dominusnode_setup to create an account and get an API key.\n\n");
         registerAccountTools(server, httpClient);
         registerCryptoTools(server, httpClient);
-        registerAgentWalletTools(server, httpClient, config);
+        registerPaypalTools(server, httpClient);
+        // Do NOT register agent-wallet tools in bootstrap mode —
+        // they require authentication and should only be available in authenticated mode.
         registerWalletAuthTools(server, httpClient);
+        registerSlotsTools(server, httpClient);
         // Register a helper tool that tells the agent what to do
         registerBootstrapHelper(server);
         const transport = new StdioServerTransport();
         await server.connect(transport);
-        process.stderr.write("Dominus Node MCP Server ready — bootstrap mode (8 tools)\n");
-        process.stderr.write("Run dominusnode_setup or dominusnode_wallet_setup to create an account and unlock all 27 tools.\n");
+        process.stderr.write("Dominus Node MCP Server ready — bootstrap mode (15 tools + bootstrap helper)\n");
+        process.stderr.write("Run dominusnode_setup or dominusnode_wallet_setup to create an account and unlock all 57 tools.\n");
     }
     else {
         // ── Authenticated Mode ──────────────────────────────────────────
@@ -80,11 +93,14 @@ async function main() {
         registerSessionsTools(server, httpClient);
         registerAccountTools(server, httpClient);
         registerCryptoTools(server, httpClient);
+        registerPaypalTools(server, httpClient);
         registerAgentWalletTools(server, httpClient, config);
         registerWalletAuthTools(server, httpClient);
+        registerSlotsTools(server, httpClient);
+        registerTeamsTools(server, httpClient);
         const transport = new StdioServerTransport();
         await server.connect(transport);
-        process.stderr.write("Dominus Node MCP Server ready — 27 tools available\n");
+        process.stderr.write("Dominus Node MCP Server ready — 57 tools available\n");
     }
 }
 function registerBootstrapHelper(server) {
@@ -93,6 +109,11 @@ function registerBootstrapHelper(server) {
             `Dominus Node Bootstrap Mode`,
             ``,
             `You're running without an API key. Here's how to get started:`,
+            ``,
+            `Step 0: Check slot availability`,
+            `  Use dominusnode_check_slots to see if registration slots are open.`,
+            `  Alpha is limited to 250 users. If slots are full, use`,
+            `  dominusnode_join_waitlist to get notified when one opens.`,
             ``,
             `Option 1: One-shot setup (recommended)`,
             `  Use dominusnode_setup with an email and password.`,
@@ -104,15 +125,29 @@ function registerBootstrapHelper(server) {
             ``,
             `Option 3: Step by step (email/password)`,
             `  1. dominusnode_register — Create an account`,
-            `  2. dominusnode_create_key — Generate an API key`,
+            `  2. dominusnode_login — Log in if you already have an account`,
+            `  Note: To create API keys, use dominusnode_setup (one-shot) or`,
+            `  set DOMINUSNODE_API_KEY and restart to unlock dominusnode_create_key.`,
             ``,
-            `Option 4: Pay with crypto (no account needed)`,
-            `  Use dominusnode_pay_crypto to create a payment invoice.`,
-            `  Pay with BTC, ETH, XMR, SOL, or ZEC.`,
+            `Option 4: Top up with crypto or PayPal`,
+            `  After registering, use dominusnode_pay_crypto to add funds.`,
+            `  Supports BTC, ETH, LTC, XMR, ZEC, USDC, SOL, USDT, DAI, BNB, LINK.`,
+            `  Or use dominusnode_pay_paypal for PayPal top-up (min $5).`,
+            `  Check your balance with dominusnode_get_balance to confirm funds arrived.`,
+            ``,
+            `Option 5: Multi-agent teams (manage multiple AI agents)`,
+            `  Lead agent sets up account + payment, then:`,
+            `  1. dominusnode_create_team — Create a team for your agents`,
+            `  2. dominusnode_team_fund — Fund team wallet from personal wallet`,
+            `  3. Sub-agents register via dominusnode_setup (auto-verified)`,
+            `  4. dominusnode_team_add_member — Add sub-agents by email`,
+            `  5. dominusnode_team_create_key — Create shared team API keys`,
+            `  All traffic bills to team wallet. Only lead needs payment.`,
             ``,
             `After setup, set DOMINUSNODE_API_KEY in your environment`,
-            `to unlock all 27 tools on next startup.`,
+            `to unlock all 57 tools on next startup.`,
             ``,
+            `Email auto-verified for MCP agents — crypto payments enabled (11 currencies).`,
             `Free tier: 10 connections, 1GB bandwidth — no payment required.`,
         ].join("\n");
         return { content: [{ type: "text", text }] };

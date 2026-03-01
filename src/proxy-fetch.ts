@@ -12,6 +12,7 @@ export interface ProxyFetchOptions {
   country?: string;
   state?: string;
   city?: string;
+  poolType?: "dc" | "residential" | "auto";
   timeoutMs?: number;
 }
 
@@ -49,23 +50,26 @@ function isBinaryContentType(contentType: string): boolean {
   return BINARY_CONTENT_TYPES.some((t) => lower.includes(t));
 }
 
-function buildProxyUsername(apiKey: string, opts: ProxyFetchOptions): string {
-  let username = encodeURIComponent(apiKey);
+function buildProxyUsername(opts: ProxyFetchOptions): string {
+  const parts: string[] = [];
+  if (opts.poolType && opts.poolType !== "auto") {
+    parts.push(opts.poolType);
+  }
   if (opts.country) {
-    username += `-country_${encodeURIComponent(opts.country.toUpperCase())}`;
+    parts.push(`country-${encodeURIComponent(opts.country.toUpperCase())}`);
   }
   if (opts.state) {
-    username += `-state_${encodeURIComponent(opts.state)}`;
+    parts.push(`state-${encodeURIComponent(opts.state)}`);
   }
   if (opts.city) {
-    username += `-city_${encodeURIComponent(opts.city)}`;
+    parts.push(`city-${encodeURIComponent(opts.city)}`);
   }
-  return username;
+  return parts.length > 0 ? parts.join("-") : "auto";
 }
 
 function buildProxyAuth(apiKey: string, opts: ProxyFetchOptions): string {
-  const username = buildProxyUsername(apiKey, opts);
-  return "Basic " + Buffer.from(`${username}:x`).toString("base64");
+  const username = buildProxyUsername(opts);
+  return "Basic " + Buffer.from(`${username}:${apiKey}`).toString("base64");
 }
 
 const BLOCKED_HOSTNAMES = new Set([
@@ -79,12 +83,62 @@ const BLOCKED_HOSTNAMES = new Set([
   "[::]",
 ]);
 
+// Normalize non-standard IP representations (octal, hex, decimal)
+// to standard dotted-decimal to prevent SSRF bypasses like 0x7f000001, 2130706433, 0177.0.0.1
+function normalizeIpv4(hostname: string): string | null {
+  // Single decimal integer (e.g., 2130706433 = 127.0.0.1)
+  if (/^\d+$/.test(hostname)) {
+    const n = parseInt(hostname, 10);
+    if (n >= 0 && n <= 0xffffffff) {
+      return `${(n >>> 24) & 0xff}.${(n >>> 16) & 0xff}.${(n >>> 8) & 0xff}.${n & 0xff}`;
+    }
+  }
+  // Hex notation (e.g., 0x7f000001)
+  if (/^0x[0-9a-fA-F]+$/i.test(hostname)) {
+    const n = parseInt(hostname, 16);
+    if (n >= 0 && n <= 0xffffffff) {
+      return `${(n >>> 24) & 0xff}.${(n >>> 16) & 0xff}.${(n >>> 8) & 0xff}.${n & 0xff}`;
+    }
+  }
+  // Octal or mixed-radix octets (e.g., 0177.0.0.1, 0x7f.0.0.1)
+  const parts = hostname.split(".");
+  if (parts.length === 4) {
+    const octets: number[] = [];
+    for (const part of parts) {
+      let val: number;
+      if (/^0x[0-9a-fA-F]+$/i.test(part)) {
+        val = parseInt(part, 16);
+      } else if (/^0\d+$/.test(part)) {
+        val = parseInt(part, 8);
+      } else if (/^\d+$/.test(part)) {
+        val = parseInt(part, 10);
+      } else {
+        return null; // Not an IP
+      }
+      if (isNaN(val) || val < 0 || val > 255) return null;
+      octets.push(val);
+    }
+    return octets.join(".");
+  }
+  return null;
+}
+
 function isPrivateIp(hostname: string): boolean {
   // Strip brackets from IPv6
-  const ip = hostname.replace(/^\[|\]$/g, "");
+  let ip = hostname.replace(/^\[|\]$/g, "");
+
+  // Strip IPv6 zone ID (e.g., %25eth0, %eth0) before any analysis
+  const zoneIdx = ip.indexOf("%");
+  if (zoneIdx !== -1) {
+    ip = ip.substring(0, zoneIdx);
+  }
+
+  // Normalize non-standard IP formats before checking
+  const normalized = normalizeIpv4(ip);
+  const checkIp = normalized ?? ip;
 
   // IPv4 private ranges
-  const ipv4Match = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  const ipv4Match = checkIp.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (ipv4Match) {
     const [, a, b] = ipv4Match.map(Number);
     if (a === 0) return true;                       // 0.0.0.0/8
@@ -124,6 +178,30 @@ function isPrivateIp(hostname: string): boolean {
     return isPrivateIp(embedded);
   }
 
+  // IPv4-compatible IPv6 (::x.x.x.x) — deprecated but still parsed
+  if (ipLower.startsWith("::") && !ipLower.startsWith("::ffff:")) {
+    const rest = ipLower.slice(2);
+    if (rest && rest.includes(".")) return isPrivateIp(rest);
+    const hexParts = rest.split(":");
+    if (hexParts.length === 2 && hexParts[0] && hexParts[1]) {
+      const hi = parseInt(hexParts[0], 16);
+      const lo = parseInt(hexParts[1], 16);
+      if (!isNaN(hi) && !isNaN(lo)) {
+        const reconstructed = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        return isPrivateIp(reconstructed);
+      }
+    }
+  }
+
+  // Teredo (2001:0000::/32) — block unconditionally
+  if (ipLower.startsWith("2001:0000:") || ipLower.startsWith("2001:0:")) return true;
+
+  // 6to4 (2002::/16) — block unconditionally
+  if (ipLower.startsWith("2002:")) return true;
+
+  // IPv6 multicast (ff00::/8)
+  if (ipLower.startsWith("ff")) return true;
+
   return false;
 }
 
@@ -150,10 +228,22 @@ export function validateUrl(url: string): URL {
     throw new Error("Requests to private/internal IP addresses are blocked");
   }
 
+  // Block .localhost TLD (RFC 6761) — "foo.localhost" resolves to loopback
+  if (hostname.endsWith(".localhost")) {
+    throw new Error("Requests to localhost/loopback addresses are blocked");
+  }
+
   // Block hostnames ending in .local, .internal, .arpa
   if (hostname.endsWith(".local") || hostname.endsWith(".internal") || hostname.endsWith(".arpa")) {
     throw new Error("Requests to internal network hostnames are blocked");
   }
+
+  // DNS rebinding note — proxyFetch always routes through the upstream proxy
+  // (config.proxyHost), which does its own DNS resolution. The proxy-gateway has
+  // double-resolve DNS rebinding protection. A DNS rebinding attack would need to
+  // target the upstream proxy's resolver, which is not attacker-controlled.
+  // The isPrivateIp() check above handles the static case; dynamic DNS rebinding
+  // is mitigated by the upstream proxy's own protections.
 
   return parsed;
 }
@@ -171,6 +261,17 @@ export async function proxyFetch(
   const timeoutMs = Math.min(opts.timeoutMs ?? config.fetchTimeoutMs, 120_000);
   const maxBytes = config.fetchMaxResponseBytes;
   const method = (opts.method ?? "GET").toUpperCase();
+
+  // Enforce read-only methods at function level (defense-in-depth)
+  const ALLOWED_PROXY_METHODS = new Set(["GET", "HEAD"]);
+  if (!ALLOWED_PROXY_METHODS.has(method)) {
+    throw new Error(`Only GET and HEAD methods are allowed for proxy fetch, got ${method}`);
+  }
+
+  // Drop body on GET/HEAD — these methods should never carry a request body
+  if (method === "GET" || method === "HEAD") {
+    opts.body = undefined;
+  }
 
   // Validate user-supplied headers to prevent CRLF injection
   if (opts.headers) {
@@ -198,6 +299,18 @@ function httpProxyFetch(
       reject(new Error(`Proxy request timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
+    // Block smuggling-prone headers on HTTP path (matches HTTPS path blocklist)
+    // Add user-agent to blocked set (matches HTTPS path PROTECTED_HEADERS)
+    const BLOCKED_HTTP_HEADERS = new Set(["host", "connection", "content-length", "transfer-encoding", "proxy-authorization", "user-agent", "authorization"]);
+    const safeHttpHeaders: Record<string, string> = {};
+    if (opts.headers) {
+      for (const [key, value] of Object.entries(opts.headers)) {
+        if (!BLOCKED_HTTP_HEADERS.has(key.toLowerCase())) {
+          safeHttpHeaders[key] = value;
+        }
+      }
+    }
+
     const req = http.request(
       {
         hostname: config.proxyHost,
@@ -205,7 +318,7 @@ function httpProxyFetch(
         method,
         path: opts.url,
         headers: {
-          ...opts.headers,
+          ...safeHttpHeaders,
           "Proxy-Authorization": buildProxyAuth(apiKey, opts),
           Host: parsed.host,
         },
@@ -214,9 +327,14 @@ function httpProxyFetch(
         collectResponse(res, maxBytes, timer).then(
           ({ body, truncated, byteCount }) => {
             const contentType = res.headers["content-type"] ?? "";
+            // Redact security-sensitive response headers
+            const REDACTED_RESP = new Set([
+              "set-cookie", "www-authenticate", "proxy-authenticate",
+              "authorization", "proxy-authorization",
+            ]);
             const responseHeaders: Record<string, string> = {};
             for (const [key, value] of Object.entries(res.headers)) {
-              if (value) responseHeaders[key] = Array.isArray(value) ? value.join(", ") : value;
+              if (value && !REDACTED_RESP.has(key)) responseHeaders[key] = Array.isArray(value) ? value.join(", ") : value;
             }
 
             let responseBody: string;
@@ -273,14 +391,15 @@ function httpsProxyFetch(
     let socket: net.Socket | undefined;
 
     // Step 1: CONNECT tunnel
+    const connectHost = parsed.hostname.includes(":") ? `[${parsed.hostname}]` : parsed.hostname;
     const connectReq = http.request({
       hostname: config.proxyHost,
       port: config.httpProxyPort,
       method: "CONNECT",
-      path: `${parsed.hostname}:${parsed.port || 443}`,
+      path: `${connectHost}:${parsed.port || 443}`,
       headers: {
         "Proxy-Authorization": buildProxyAuth(apiKey, opts),
-        Host: `${parsed.hostname}:${parsed.port || 443}`,
+        Host: `${connectHost}:${parsed.port || 443}`,
       },
     });
 
@@ -306,13 +425,36 @@ function httpsProxyFetch(
         () => {
           // Step 3: Send HTTP request through TLS tunnel
           const requestPath = parsed.pathname + parsed.search;
+          // Validate request path for CRLF injection before writing raw HTTP request line
+          if (/[\r\n]/.test(requestPath)) {
+            clearTimeout(timer);
+            tlsSocket.destroy();
+            reject(new Error("Request path contains invalid characters"));
+            return;
+          }
+          // Set base headers first, then user headers, but block security-sensitive overrides
+          const BLOCKED_HEADERS = new Set(["host", "connection", "content-length", "transfer-encoding", "proxy-authorization", "authorization"]);
+          const safeUserHeaders: Record<string, string> = {};
+          if (opts.headers) {
+            for (const [key, value] of Object.entries(opts.headers)) {
+              if (!BLOCKED_HEADERS.has(key.toLowerCase())) {
+                safeUserHeaders[key] = value;
+              }
+            }
+          }
+          // Merge user headers WITHOUT allowing override of security-critical base headers
+          const PROTECTED_HEADERS = new Set(["host", "user-agent", "connection", "content-length"]);
           const reqHeaders: Record<string, string> = {
             Host: parsed.host,
             "User-Agent": "dominusnode-mcp-server/1.0.0",
             Accept: "*/*",
             Connection: "close",
-            ...opts.headers,
           };
+          for (const [key, value] of Object.entries(safeUserHeaders)) {
+            if (!PROTECTED_HEADERS.has(key.toLowerCase())) {
+              reqHeaders[key] = value;
+            }
+          }
 
           let reqLine = `${method} ${requestPath} HTTP/1.1\r\n`;
           for (const [key, value] of Object.entries(reqHeaders)) {
@@ -447,12 +589,19 @@ function parseHttpResponse(
         const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
         const statusText = statusMatch?.[2] ?? "";
 
+        // Redact security-sensitive response headers before returning to MCP client
+        const REDACTED_RESPONSE_HEADERS = new Set([
+          "set-cookie", "www-authenticate", "proxy-authenticate",
+          "authorization", "proxy-authorization",
+        ]);
         const headers: Record<string, string> = {};
         const headerLines = headerSection.split("\r\n").slice(1);
         for (const line of headerLines) {
           const colonIdx = line.indexOf(":");
           if (colonIdx > 0) {
-            headers[line.substring(0, colonIdx).trim().toLowerCase()] = line.substring(colonIdx + 1).trim();
+            const key = line.substring(0, colonIdx).trim().toLowerCase();
+            if (REDACTED_RESPONSE_HEADERS.has(key)) continue;
+            headers[key] = line.substring(colonIdx + 1).trim();
           }
         }
 

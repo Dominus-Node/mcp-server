@@ -1,26 +1,61 @@
 import { z } from "zod";
-const SUPPORTED_CRYPTO = ["BTC", "ETH", "XMR", "SOL", "ZEC", "USDC", "USDT"];
+const SUPPORTED_CRYPTO = ["BTC", "ETH", "LTC", "XMR", "ZEC", "USDC", "SOL", "USDT", "DAI", "BNB", "LINK"];
+const CRYPTO_PAY_MAX = 5;
+const CRYPTO_PAY_WINDOW_MS = 3_600_000;
+const cryptoPayTimestamps = [];
+function checkCryptoPayLimit() {
+    const now = Date.now();
+    while (cryptoPayTimestamps.length > 0 && now - cryptoPayTimestamps[0] > CRYPTO_PAY_WINDOW_MS) {
+        cryptoPayTimestamps.shift();
+    }
+    if (cryptoPayTimestamps.length > 100)
+        cryptoPayTimestamps.length = 100;
+    if (cryptoPayTimestamps.length >= CRYPTO_PAY_MAX)
+        return false;
+    cryptoPayTimestamps.push(now);
+    return true;
+}
+// Rate limit check_payment to prevent polling abuse
+const CHECK_PAYMENT_MAX = 30;
+const CHECK_PAYMENT_WINDOW_MS = 300_000; // 5 minutes
+const checkPaymentTimestamps = [];
+function checkPaymentRateLimit() {
+    const now = Date.now();
+    while (checkPaymentTimestamps.length > 0 && now - checkPaymentTimestamps[0] > CHECK_PAYMENT_WINDOW_MS) {
+        checkPaymentTimestamps.shift();
+    }
+    if (checkPaymentTimestamps.length > 100)
+        checkPaymentTimestamps.length = 100;
+    if (checkPaymentTimestamps.length >= CHECK_PAYMENT_MAX)
+        return false;
+    checkPaymentTimestamps.push(now);
+    return true;
+}
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function registerCryptoTools(server, httpClient) {
-    server.tool("dominusnode_pay_crypto", "Create a cryptocurrency payment invoice to top up your Dominus Node wallet. Supports BTC, ETH, XMR (Monero), SOL, ZEC (Zcash), USDC, and USDT. Returns a payment address and amount. Privacy coins (XMR, ZEC) provide anonymous billing — no identity linked to payment.", {
-        amount_usd: z.number().min(1).max(10000).describe("Amount in USD to add to wallet (min $1)"),
-        currency: z.enum(SUPPORTED_CRYPTO).describe("Cryptocurrency to pay with (BTC, ETH, XMR, SOL, ZEC, USDC, USDT)"),
+    server.tool("dominusnode_pay_crypto", "Create a cryptocurrency payment invoice to top up your Dominus Node wallet. Supports BTC, ETH, LTC, XMR, ZEC, USDC, SOL, USDT, DAI, BNB, and LINK. Returns a payment address and amount. Privacy coins (XMR, ZEC) provide anonymous billing — no identity linked to payment.", {
+        amount_usd: z.number().min(5).max(1000).describe("Amount in USD to add to wallet (min $5, max $1000)"),
+        currency: z.enum(SUPPORTED_CRYPTO).describe("Cryptocurrency to pay with (BTC, ETH, LTC, XMR, ZEC, USDC, SOL, USDT, DAI, BNB, LINK)"),
     }, async (args) => {
         try {
-            const data = await httpClient.post("/api/wallet/topup/crypto", { amount: args.amount_usd, currency: args.currency });
+            if (!checkCryptoPayLimit()) {
+                return {
+                    isError: true,
+                    content: [{ type: "text", text: "Rate limit exceeded: maximum 5 crypto payment invoices per hour. Please wait before creating another." }],
+                };
+            }
+            const data = await httpClient.post("/api/wallet/topup/crypto", { amountUsd: args.amount_usd, currency: args.currency.toLowerCase() });
             const text = [
                 `Crypto Payment Invoice Created`,
                 ``,
-                `Invoice ID: ${data.invoice_id}`,
+                `Invoice ID: ${data.invoiceId}`,
                 `Amount: $${args.amount_usd} USD`,
-                `Pay: ${data.pay_amount} ${data.pay_currency}`,
+                `Currency: ${data.payCurrency}`,
+                `Price Amount: ${data.priceAmount}`,
                 ``,
-                `Send exactly ${data.pay_amount} ${data.pay_currency} to:`,
-                `  ${data.pay_address}`,
+                `Pay here: ${data.invoiceUrl}`,
                 ``,
-                `Status: ${data.status}`,
-                `Expires: ${data.expiration_estimate_date}`,
-                ``,
-                `Use dominusnode_check_payment to check payment status.`,
+                `The invoice page has full payment details (address, exact amount, expiration).`,
                 args.currency === "XMR" || args.currency === "ZEC"
                     ? `\nPrivacy note: ${args.currency} provides untraceable payment — no identity linked.`
                     : "",
@@ -34,34 +69,32 @@ export function registerCryptoTools(server, httpClient) {
             };
         }
     });
-    server.tool("dominusnode_check_payment", "Check the status of a cryptocurrency payment invoice. Returns whether payment has been received and confirmed.", {
-        invoice_id: z.string().min(1).max(100).describe("Invoice ID from dominusnode_pay_crypto"),
+    server.tool("dominusnode_check_payment", "Check the status of a cryptocurrency payment invoice. Returns current payment status (pending, confirming, confirmed, finished, failed, expired).", {
+        invoice_id: z.string().regex(UUID_RE).describe("Invoice ID (UUID) from dominusnode_pay_crypto"),
     }, async (args) => {
         try {
+            if (!checkPaymentRateLimit()) {
+                return {
+                    isError: true,
+                    content: [{ type: "text", text: "Rate limit exceeded: maximum 30 payment status checks per 5 minutes. Please wait before checking again." }],
+                };
+            }
             const data = await httpClient.get(`/api/wallet/crypto/status/${encodeURIComponent(args.invoice_id)}`);
-            const statusEmoji = {
-                waiting: "Waiting for payment...",
-                confirming: "Payment detected, confirming...",
-                confirmed: "Payment confirmed!",
-                finished: "Payment complete! Wallet credited.",
-                failed: "Payment failed.",
-                expired: "Invoice expired.",
-            };
             const text = [
-                `Payment Status: ${statusEmoji[data.status] ?? data.status}`,
-                `Invoice: ${data.invoice_id}`,
-                `Expected: ${data.pay_amount} ${data.pay_currency}`,
-                `Received: ${data.actually_paid} ${data.pay_currency}`,
-                data.status === "finished"
-                    ? `Wallet credited: $${(data.outcome_amount / 100).toFixed(2)} USD`
-                    : "",
-            ].filter(Boolean).join("\n");
+                `Payment Status`,
+                ``,
+                `Invoice ID: ${data.invoiceId}`,
+                `Status: ${data.status}`,
+                `Amount: $${(data.amountCents / 100).toFixed(2)}`,
+                `Provider: ${data.provider}`,
+                `Created: ${data.createdAt}`,
+            ].join("\n");
             return { content: [{ type: "text", text }] };
         }
         catch (err) {
             return {
                 isError: true,
-                content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+                content: [{ type: "text", text: `Payment check error: ${err instanceof Error ? err.message : String(err)}` }],
             };
         }
     });

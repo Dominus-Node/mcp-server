@@ -11,7 +11,9 @@ export function registerWalletTools(server: McpServer, httpClient: HttpClient): 
     async () => {
       try {
         const wallet = await httpClient.get<WalletBalance>("/api/wallet");
-        const text = `Balance: $${wallet.balance_usd} (${wallet.balance_cents} cents)`;
+        const balanceUsd = typeof wallet.balanceUsd === "number" ? wallet.balanceUsd : 0;
+        const balanceCents = typeof wallet.balanceCents === "number" ? wallet.balanceCents : 0;
+        const text = `Balance: $${balanceUsd.toFixed(2)} (${balanceCents} cents)`;
         return { content: [{ type: "text", text }] };
       } catch (err) {
         return {
@@ -24,18 +26,16 @@ export function registerWalletTools(server: McpServer, httpClient: HttpClient): 
 
   server.tool(
     "dominusnode_get_forecast",
-    "Get spending forecast: daily average spend, estimated days remaining, and projected depletion date.",
+    "Get spending forecast: daily average spend, estimated days remaining, and spending trend.",
     {},
     async () => {
       try {
         const forecast = await httpClient.get<WalletForecast>("/api/wallet/forecast");
         const lines = [
-          `Daily Average: ${(forecast.daily_average_cents / 100).toFixed(2)} USD`,
-          `Days Remaining: ${forecast.days_remaining ?? "unlimited"}`,
+          `Daily Average: $${(forecast.dailyAvgCents / 100).toFixed(2)} USD`,
+          `Days Remaining: ${forecast.daysRemaining ?? "unlimited"}`,
+          `Trend: ${forecast.trend} (${forecast.trendPct}%)`,
         ];
-        if (forecast.estimated_depletion_date) {
-          lines.push(`Estimated Depletion: ${forecast.estimated_depletion_date}`);
-        }
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
         return {
@@ -55,16 +55,17 @@ export function registerWalletTools(server: McpServer, httpClient: HttpClient): 
     },
     async (args) => {
       try {
+        const offset = (args.page - 1) * args.limit;
         const data = await httpClient.get<TransactionList>(
-          `/api/wallet/transactions?page=${args.page}&limit=${args.limit}`,
+          `/api/wallet/transactions?offset=${offset}&limit=${args.limit}`,
         );
         if (data.transactions.length === 0) {
           return { content: [{ type: "text", text: "No transactions found." }] };
         }
         const lines = data.transactions.map(
-          (t) => `${t.created_at} | ${t.type.padEnd(10)} | ${(t.amount_cents / 100).toFixed(2)} USD | ${t.description}`,
+          (t) => `${t.createdAt ?? "unknown"} | ${(t.type ?? "unknown").padEnd(10)} | $${((t.amountCents ?? 0) / 100).toFixed(2)} | ${t.description ?? ""}`,
         );
-        lines.unshift(`Transactions (page ${data.page}, ${data.total} total):`);
+        lines.unshift(`Transactions (page ${args.page}):`);
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {
         return {

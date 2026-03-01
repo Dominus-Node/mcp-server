@@ -7,6 +7,7 @@ export interface ProxyFetchOptions {
     country?: string;
     state?: string;
     city?: string;
+    poolType?: "dc" | "residential" | "auto";
     timeoutMs?: number;
 }
 export interface ProxyFetchResult {
