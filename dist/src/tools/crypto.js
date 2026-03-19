@@ -65,7 +65,7 @@ export function registerCryptoTools(server, httpClient) {
         catch (err) {
             return {
                 isError: true,
-                content: [{ type: "text", text: `Payment error: ${err instanceof Error ? err.message : String(err)}` }],
+                content: [{ type: "text", text: `Payment error: ${(err instanceof Error ? err.message : String(err)).replace(/dn_(?:live|test)_[A-Za-z0-9_-]+/g, "[REDACTED]")}` }],
             };
         }
     });
@@ -94,7 +94,7 @@ export function registerCryptoTools(server, httpClient) {
         catch (err) {
             return {
                 isError: true,
-                content: [{ type: "text", text: `Payment check error: ${err instanceof Error ? err.message : String(err)}` }],
+                content: [{ type: "text", text: `Payment check error: ${(err instanceof Error ? err.message : String(err)).replace(/dn_(?:live|test)_[A-Za-z0-9_-]+/g, "[REDACTED]")}` }],
             };
         }
     });

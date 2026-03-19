@@ -3,6 +3,7 @@ const USER_AGENT = "dominusnode-mcp-server/1.0.0";
 const CREDENTIAL_PATTERNS = [
     /dn_live_[A-Za-z0-9_-]+/g,
     /dn_test_[A-Za-z0-9_-]+/g,
+    /dn_proxy_[A-Za-z0-9_.-]+/g,
     /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g,
     /Bearer\s+[A-Za-z0-9._-]+/gi,
 ];
@@ -233,6 +234,9 @@ export class HttpClient {
     }
     async patch(path, body) {
         return this.request({ method: "PATCH", path, body });
+    }
+    async put(path, body) {
+        return this.request({ method: "PUT", path, body });
     }
     async delete(path) {
         return this.request({ method: "DELETE", path });
